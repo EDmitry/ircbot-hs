@@ -8,6 +8,7 @@ import Network.Connection
   , ConnectionParams
   , connectionGetLine
   , connectionPut
+  , connectionClose
   )
 import System.IO 
 import qualified GitLab
@@ -22,6 +23,7 @@ import Control.Concurrent.STM.TQueue
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.ByteString.Char8 as B
 
+import Control.Exception.Base (bracket)
 import Control.Monad (when, forever)
 import Control.Monad.Trans (liftIO)
 import Control.Monad.State (StateT, evalStateT, lift)
@@ -105,9 +107,12 @@ write h s = do
 --     status ok200
 
 runIrcBot :: TQueue String -> IO ()
-runIrcBot queue = do ssl <- connectToServer
-                     forkIO $ listen ssl
-                     processQueue ssl queue
+runIrcBot queue = do bracket connect disconnect botLoop
+  where
+    connect = connectToServer
+    disconnect con = connectionClose con >> putStrLn "Closing the connection"
+    botLoop con = do forkIO $ processQueue con queue
+                     listen con
 
 main =  do queue <- atomically newTQueue
            forkIO $ runIrcBot queue
