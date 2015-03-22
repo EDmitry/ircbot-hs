@@ -18,13 +18,13 @@ import Web.Scotty
 import Pipes (Consumer, Pipe, Producer, yield, await, (>->), runEffect, cat)
 
 import Control.Monad.STM
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.STM.TQueue
 
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.ByteString.Char8 as B
 
-import Control.Exception.Base (bracket)
+import Control.Exception.Base (bracket, finally)
 import Control.Monad (when, forever)
 import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Trans (liftIO)
@@ -52,7 +52,7 @@ connectToServer = do
                   }                       
   return con
 
-type Bot = ReaderT Connection IO
+type Bot = ReaderT (TQueue String) IO
 
 processQueue :: TQueue String -> Bot ()
 processQueue queue = forever $ do newData <- liftIO $ atomically $ readTQueue queue
@@ -66,28 +66,36 @@ joinChannel c = write ("JOIN " ++ c)
            
 write :: String -> Bot ()
 write s = do
-  con <- ask 
-  liftIO $ connectionPut con $ B.pack (s ++ "\r\n")
-  liftIO $ printf    "> %s\n" s
+  queue <- ask 
+  liftIO $ atomically $ writeTQueue queue s
 
+writeThread :: TQueue String -> Connection -> IO ()
+writeThread queue con = forever $ do newData <- atomically (readTQueue queue)
+                                     connectionPut con $ B.pack (newData ++ "\r\n") 
+                                     printf    "> %s\n" newData
+ 
 runIrcBot :: TQueue String -> IO ()
-runIrcBot queue = do bracket connect disconnect loop
+runIrcBot queue = do writeQueue <- atomically newTQueue
+                     bracket (connect writeQueue) disconnect (loop writeQueue)
   where
-    connect = connectToServer
-    disconnect con = connectionClose con >> putStrLn "Closing the connection"
-    loop con = do forkIO $ runReaderT (processQueue queue) con
-                  runReaderT (do write ("NICK " ++ nick)
-                                 write ("USER " ++ nick ++ " 0 * :test bot")
-                                 runEffect (messages >-> handlePing >-> sequence_ [nickNegotiation, nickServId, forever await])
-                              ) con
+    connect writeQueue = do con <- connectToServer
+                            writerThreadId <- forkIO $ writeThread writeQueue con
+                            return (con, writerThreadId)
+    disconnect (con, writerThreadId) = do connectionClose con
+                                          killThread writerThreadId
+                                          putStrLn "Closing the connection"
+    loop writeQueue (con, _) = do forkIO $ runReaderT (processQueue queue) writeQueue
+                                  runReaderT (do write ("NICK " ++ nick)
+                                                 write ("USER " ++ nick ++ " 0 * :test bot")
+                                                 runEffect (messages con >-> handlePing >-> sequence_ [nickNegotiation, nickServId, forever await])
+                                             ) writeQueue
 
-messages :: Producer IRC.Message Bot ()
-messages = do con <- ask
-              message <- liftIO $ fmap IRC.decode (connectionGetLine 512 con)
-              case message of
-                Just a -> yield a
-                Nothing -> return ()
-              messages
+messages :: Connection -> Producer IRC.Message Bot ()
+messages con = do message <- liftIO $ fmap IRC.decode (connectionGetLine 512 con)
+                  case message of
+                    Just a -> yield a
+                    Nothing -> return ()
+                  messages con
 
 handlePing :: Pipe IRC.Message IRC.Message Bot ()
 handlePing = do m <- await
