@@ -15,9 +15,10 @@ import qualified GitLab
 import Text.Printf
 import qualified Network.IRC as IRC
 import Web.Scotty
+import Pipes (Consumer, Pipe, Producer, yield, await, (>->), runEffect, cat)
 
 import Control.Monad.STM
-import Control.Concurrent
+import Control.Concurrent (forkIO)
 import Control.Concurrent.STM.TQueue
 
 import qualified Data.ByteString.Lazy.Char8 as BL
@@ -25,8 +26,10 @@ import qualified Data.ByteString.Char8 as B
 
 import Control.Exception.Base (bracket)
 import Control.Monad (when, forever)
+import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Trans (liftIO)
 import Control.Monad.State (StateT, evalStateT, lift)
+import Control.Monad.Reader (runReaderT, ReaderT, ask)
 import qualified Control.Monad.State as S
 import Data.List (isPrefixOf, isInfixOf)
 import Data.Monoid (mconcat)
@@ -47,73 +50,78 @@ connectToServer = do
                   , connectionUseSecure = Just $ TLSSettingsSimple True False False
                   , connectionUseSocks = Nothing
                   }                       
-  write con ("NICK " ++ nick)
-  write con ("USER " ++ nick ++ " 0 * :test bot")
   return con
 
-listen :: Connection -> IO ()
-listen ssl = evalStateT (forever (liftIO (connectionGetLine 512 ssl) >>= processLine ssl)) Initial >> return ()
+type Bot = ReaderT Connection IO
 
-data ConnectionState = Initial | NickIdentification | Connected
+processQueue :: TQueue String -> Bot ()
+processQueue queue = forever $ do newData <- liftIO $ atomically $ readTQueue queue
+                                  privmsg chan newData
 
-processQueue :: Connection -> TQueue String -> IO ()
-processQueue ssl queue = forever $ do newData <- atomically $ readTQueue queue
-                                      privmsg ssl chan newData
+privmsg :: String -> String -> Bot ()
+privmsg dest s = write ("PRIVMSG " ++ dest ++ " :" ++ s)
 
-processLine :: Connection -> B.ByteString -> StateT ConnectionState IO ()
-processLine ssl line = case message of
-                         Just a -> processMessage ssl a
-                         Nothing -> return ()
-  where message = IRC.decode line
+joinChannel :: String -> Bot ()
+joinChannel c = write ("JOIN " ++ c)
+           
+write :: String -> Bot ()
+write s = do
+  con <- ask 
+  liftIO $ connectionPut con $ B.pack (s ++ "\r\n")
+  liftIO $ printf    "> %s\n" s
 
-processMessage :: Connection -> IRC.Message -> StateT ConnectionState IO ()
-processMessage ssl m = do
-    state <- S.get
-    case state of
-      Initial -> when (IRC.msg_command m == "376") $ do
-        liftIO $ do putStrLn "connected!"
-                    privmsg ssl "NickServ" ("identify " ++ nickPassword)
-        S.put NickIdentification
-      NickIdentification ->
-        when (identified m) $ do
-          liftIO $ do putStrLn "identified!"
-                      joinChannel ssl chan
-          S.put Connected
-      Connected -> return ()
-    liftIO $ print m
-    when (IRC.msg_command m == "PING") $
-      (liftIO . pong . mconcat . map show) (IRC.msg_params m)
+runIrcBot :: TQueue String -> IO ()
+runIrcBot queue = do bracket connect disconnect loop
   where
-    pong x = write ssl ("PONG :" ++ x) 
+    connect = connectToServer
+    disconnect con = connectionClose con >> putStrLn "Closing the connection"
+    loop con = do forkIO $ runReaderT (processQueue queue) con
+                  runReaderT (do write ("NICK " ++ nick)
+                                 write ("USER " ++ nick ++ " 0 * :test bot")
+                                 runEffect (messages >-> handlePing >-> sequence_ [nickNegotiation, nickServId, forever await])
+                              ) con
+
+messages :: Producer IRC.Message Bot ()
+messages = do con <- ask
+              message <- liftIO $ fmap IRC.decode (connectionGetLine 512 con)
+              case message of
+                Just a -> yield a
+                Nothing -> return ()
+              messages
+
+handlePing :: Pipe IRC.Message IRC.Message Bot ()
+handlePing = do m <- await
+                if IRC.msg_command m == "PING"
+                  then (pong . mconcat . map B.unpack) (IRC.msg_params m)
+                  else yield m
+                handlePing
+  where
+    pong x = lift $ write ("PONG :" ++ x) 
+   
+nickNegotiation :: Consumer IRC.Message Bot ()
+nickNegotiation = do m <- await
+                     if (IRC.msg_command m == "376")
+                       then do liftIO $ putStrLn "connected!"
+                               lift $ privmsg "NickServ" ("identify " ++ nickPassword)
+                       else nickNegotiation
+
+nickServId :: Consumer IRC.Message Bot ()
+nickServId = do m <- await
+                if (identified m)
+                  then do liftIO $ putStrLn "Identified!"
+                          lift $ joinChannel chan
+                  else nickServId
+  where
     isNickServ (Just (IRC.NickName "NickServ" _ _)) = True
     isNickServ _ = False
     identified m = isNickServ (IRC.msg_prefix m) && "now identified" `isInfixOf` (mconcat . map show) (IRC.msg_params m)
 
-privmsg :: Connection -> String -> String -> IO ()
-privmsg h dest s = write h ("PRIVMSG " ++ dest ++ " :" ++ s)
-
-joinChannel :: Connection -> String -> IO ()
-joinChannel s c = write s ("JOIN " ++ c)
-           
-write :: Connection -> String -> IO ()
-write h s = do
-    connectionPut h $ B.pack (s ++ "\r\n")
-    printf    "> %s\n" s
+main =  do queue <- atomically newTQueue
+           forkIO $ runIrcBot queue
+  -- web_service queue
 
 -- web_service :: TQueue String -> IO ()
 -- web_service queue = scotty 25000 $ do
 --   get "/" $ do
 --     liftIO $ atomically $ writeTQueue queue "test passed"    
 --     status ok200
-
-runIrcBot :: TQueue String -> IO ()
-runIrcBot queue = do bracket connect disconnect botLoop
-  where
-    connect = connectToServer
-    disconnect con = connectionClose con >> putStrLn "Closing the connection"
-    botLoop con = do forkIO $ processQueue con queue
-                     listen con
-
-main =  do queue <- atomically newTQueue
-           forkIO $ runIrcBot queue
-  -- web_service queue
