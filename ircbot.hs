@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ExistentialQuantification #-}
 import Network.Connection
   (Connection
   , TLSSettings (TLSSettingsSimple)
@@ -17,6 +18,7 @@ import Text.Printf
 import qualified Network.IRC as IRC
 import Web.Scotty
 import Pipes (Consumer, Pipe, Producer, yield, await, (>->), runEffect, cat)
+import Pipes.Concurrent (spawn, unbounded, Buffer(Unbounded), toOutput, fromInput)
 
 import Control.Monad.STM
 import Control.Concurrent (forkIO, killThread, threadDelay)
@@ -36,8 +38,9 @@ import Control.Monad.State (StateT, evalStateT, lift)
 import Control.Monad.Reader (runReaderT, ReaderT, ask)
 import qualified Control.Monad.State as S
 import Data.List (isPrefixOf, isInfixOf)
-import Data.Monoid (mconcat)
+import Data.Monoid (mconcat, (<>))
 import Data.Default (def)
+import Data.Function (on)
 
 server = "irc.freenode.org"
 port   = 6697
@@ -57,6 +60,45 @@ connectToServer = do
   return con
 
 type Bot = ReaderT (TQueue String) IO
+
+class BotModule m where
+  messageHandler :: m -> Consumer IRC.Message Bot ()
+  
+data ModuleBox = forall m. BotModule m => ModuleBox m
+instance BotModule ModuleBox where
+  messageHandler (ModuleBox s) = messageHandler s
+--------------------------------------------------------
+data IdModule = IdModule 
+instance BotModule IdModule where
+  messageHandler = idConsumer
+
+idConsumer :: IdModule -> Consumer IRC.Message Bot ()
+idConsumer mod = do m <- await
+                    case parseCommand "id" m of
+                      Just (chan, body) -> lift $ privmsg chan body
+                      Nothing -> return ()
+                    case parseJoin m of
+                      Just (nick, chan) -> lift $ privmsg chan ("Greetings, " ++ nick ++ ".")
+                      Nothing -> return ()
+                    -- liftIO $ putStrLn $ show m
+                    idConsumer mod
+            
+parseCommand :: String -> IRC.Message -> Maybe (String, String)
+parseCommand cmd m
+  | IRC.msg_command m /= "PRIVMSG" = Nothing
+  | (a:b:xs) <- IRC.msg_params m = let (first:rest) = words (B.unpack b)
+                                   in if (tail first == cmd) then Just (B.unpack a, unwords rest) else Nothing
+                                                             
+  | otherwise = Nothing
+
+parseJoin :: IRC.Message -> Maybe (String, String)
+parseJoin m
+  | IRC.msg_command m /= "JOIN" = Nothing
+  | (Just (IRC.NickName nick _ _)) <- IRC.msg_prefix m = Just (B.unpack nick, B.unpack $ head $ IRC.msg_params m)
+  | otherwise = Nothing
+--------------------------------------------------------
+botModules :: [ModuleBox]
+botModules = [ModuleBox IdModule]
 
 processQueue :: TQueue String -> Bot ()
 processQueue queue = forever $ do newData <- liftIO $ atomically $ readTQueue queue
@@ -88,6 +130,7 @@ runIrcBot queue = forever $ do catchAny (connectToIRCNetwork queue) $ \e -> do
                                putStrLn "Retrying to connect..."
   where timeout = 30
                      
+-- forkIO $ runReaderT (processQueue queue) writeQueue
 connectToIRCNetwork :: TQueue String -> IO ()
 connectToIRCNetwork queue =  do bracket connectToServer disconnect loop
   where
@@ -100,15 +143,18 @@ connectToIRCNetwork queue =  do bracket connectToServer disconnect loop
       watchdogIndicator <- atomically $ newTVar False
       writerProcess <- async $ writeThread writeQueue con
       watchDogProcess <- async $ runReaderT (watchdog watchdogIndicator) writeQueue
-      -- forkIO $ runReaderT (processQueue queue) writeQueue
+      modulesWithBoxes <- mapM (\m -> do (output, input) <- spawn unbounded
+                                         return (m, output, input)) botModules
+      let modulesOutputs = foldl1 (<>) (map (\(_, b, _) -> b) modulesWithBoxes)
+      modulesThreads <- mapM (\(m, _, input) -> async $ runReaderT (runEffect (fromInput input  >-> messageHandler m)) writeQueue) modulesWithBoxes
       readLoop <- async $ runReaderT (do write ("NICK " ++ nick)
                                          write ("USER " ++ nick ++ " 0 * :test bot")
                                          runEffect (messages con >->
                                                     handlePing watchdogIndicator >->
-                                                    sequence_ [nickNegotiation, nickServId, forever await])
+                                                    sequence_ [nickNegotiation, nickServId, toOutput modulesOutputs])
                                      ) writeQueue
       waitAnyCatch [readLoop, watchDogProcess, writerProcess]
-      mapM cancel [readLoop, watchDogProcess, writerProcess]
+      mapM cancel $ [readLoop, watchDogProcess, writerProcess] <> modulesThreads
       putStrLn "We are done"
 
 watchdog :: TVar Bool -> Bot ()
