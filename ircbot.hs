@@ -29,7 +29,7 @@ import Control.Concurrent.STM.TVar (TVar, readTVar, writeTVar, newTVar)
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.ByteString.Char8 as B
 
-import Control.Exception (catch, try, throw, SomeException, AsyncException(ThreadKilled))
+import Control.Exception (throwIO, catch, try, throw, SomeException, AsyncException(ThreadKilled, UserInterrupt))
 import Control.Exception.Base (bracket, finally)
 import Control.Monad (when, forever, void)
 import Control.Monad.IO.Class (MonadIO)
@@ -67,6 +67,10 @@ class BotModule m where
 data ModuleBox = forall m. BotModule m => ModuleBox m
 instance BotModule ModuleBox where
   messageHandler (ModuleBox s) = messageHandler s
+  
+botModules :: [ModuleBox]
+botModules = [ModuleBox IdModule]
+             
 --------------------------------------------------------
 data IdModule = IdModule 
 instance BotModule IdModule where
@@ -80,9 +84,10 @@ idConsumer mod = do m <- await
                     case parseJoin m of
                       Just (nick, chan) -> lift $ privmsg chan ("Greetings, " ++ nick ++ ".")
                       Nothing -> return ()
-                    -- liftIO $ putStrLn $ show m
                     idConsumer mod
             
+--------------------------------------------------------
+                 
 parseCommand :: String -> IRC.Message -> Maybe (String, String)
 parseCommand cmd m
   | IRC.msg_command m /= "PRIVMSG" = Nothing
@@ -96,9 +101,6 @@ parseJoin m
   | IRC.msg_command m /= "JOIN" = Nothing
   | (Just (IRC.NickName nick _ _)) <- IRC.msg_prefix m = Just (B.unpack nick, B.unpack $ head $ IRC.msg_params m)
   | otherwise = Nothing
---------------------------------------------------------
-botModules :: [ModuleBox]
-botModules = [ModuleBox IdModule]
 
 processQueue :: TQueue String -> Bot ()
 processQueue queue = forever $ do newData <- liftIO $ atomically $ readTQueue queue
@@ -115,14 +117,25 @@ write s = do
   queue <- ask 
   liftIO $ atomically $ writeTQueue queue s
 
+register = do
+  write ("NICK " ++ nick)                     
+  write ("USER " ++ nick ++ " 0 * :test bot")
+
 writeThread :: TQueue String -> Connection -> IO ()
 writeThread queue con = forever $ do newData <- atomically (readTQueue queue)
                                      connectionPut con $ B.pack (newData ++ "\r\n") 
                                      printf    "> %s\n" newData
 
 catchAny :: IO a -> (SomeException -> IO a) -> IO a
-catchAny = Control.Exception.catch
-
+catchAny m f = Control.Exception.catch m onExc
+  where
+    onExc e
+      | shouldCatch e = f e
+      | otherwise = throwIO e
+    shouldCatch e
+      | show e == "user interrupt" = False
+      | otherwise = True
+                    
 runIrcBot :: TQueue String -> IO ()
 runIrcBot queue = forever $ do catchAny (connectToIRCNetwork queue) $ \e -> do
                                  putStrLn $ "Got an exception " ++ show e
@@ -138,23 +151,28 @@ connectToIRCNetwork queue =  do bracket connectToServer disconnect loop
       connectionClose con                     
       putStrLn "Closing the connection"
 
-    loop con = do 
+    loop con = bracket (runThreads con) cleanupThreads waitForThreads
+
+    runThreads con = do
       writeQueue <- atomically newTQueue
       watchdogIndicator <- atomically $ newTVar False
-      writerProcess <- async $ writeThread writeQueue con
-      watchDogProcess <- async $ runReaderT (watchdog watchdogIndicator) writeQueue
+      writerThread <- async $ writeThread writeQueue con
+      watchDogThread <- async $ runReaderT (watchdog watchdogIndicator) writeQueue
       modulesWithBoxes <- mapM (\m -> do (output, input) <- spawn unbounded
                                          return (m, output, input)) botModules
       let modulesOutputs = foldl1 (<>) (map (\(_, b, _) -> b) modulesWithBoxes)
       modulesThreads <- mapM (\(m, _, input) -> async $ runReaderT (runEffect (fromInput input  >-> messageHandler m)) writeQueue) modulesWithBoxes
-      readLoop <- async $ runReaderT (do write ("NICK " ++ nick)
-                                         write ("USER " ++ nick ++ " 0 * :test bot")
-                                         runEffect (messages con >->
-                                                    handlePing watchdogIndicator >->
-                                                    sequence_ [nickNegotiation, nickServId, toOutput modulesOutputs])
-                                     ) writeQueue
-      waitAnyCatch [readLoop, watchDogProcess, writerProcess]
-      mapM cancel $ [readLoop, watchDogProcess, writerProcess] <> modulesThreads
+      readThread <- async $ runReaderT (do register
+                                           runEffect (messages con >->
+                                                      handlePing watchdogIndicator >->
+                                                      sequence_ [nickNegotiation, nickServId, toOutput modulesOutputs])
+                                       ) writeQueue
+      return ([readThread, watchDogThread, writerThread], modulesThreads)
+
+    waitForThreads (coreThreads, modulesThreads) = void $ waitAnyCatch coreThreads
+
+    cleanupThreads (coreThreads, modulesThreads) = do
+      mapM cancel $ coreThreads <> modulesThreads
       putStrLn "We are done"
 
 watchdog :: TVar Bool -> Bot ()
