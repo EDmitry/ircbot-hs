@@ -167,12 +167,12 @@ connectToIRCNetwork queue =  do bracket connectToServer disconnect loop
       modulesWithBoxes <- mapM (\m -> do (output, input) <- spawn unbounded
                                          return (m, output, input)) botModules
       let modulesOutputs = foldl1 (<>) (map (\(_, b, _) -> b) modulesWithBoxes)
-      modulesThreads <- mapM (\(m, _, input) -> async $ runReaderT (runEffect (fromInput input  >-> messageHandler m)) writeQueue) modulesWithBoxes
-      readThread <- async $ runReaderT (do register
-                                           runEffect (messages con >->
-                                                      handlePing watchdogIndicator >->
-                                                      sequence_ [nickNegotiation, nickServId, toOutput modulesOutputs])
-                                       ) writeQueue
+      modulesThreads <- mapM (\(m, _, input) -> async $ runModule m input writeQueue) modulesWithBoxes
+      readThread <- async $ flip runReaderT writeQueue $ do
+        register
+        runEffect (messages con >->
+                   handlePing watchdogIndicator >->
+                   sequence_ [nickNegotiation, nickServId, toOutput modulesOutputs])
       return ([readThread, watchDogThread, writerThread], modulesThreads)
 
     waitForThreads (coreThreads, modulesThreads) = void $ waitAnyCatch coreThreads
@@ -180,6 +180,8 @@ connectToIRCNetwork queue =  do bracket connectToServer disconnect loop
     cleanupThreads (coreThreads, modulesThreads) = do
       mapM cancel $ coreThreads <> modulesThreads
       putStrLn "We are done"
+
+    runModule m input writeQueue = runReaderT (runEffect (fromInput input  >-> messageHandler m)) writeQueue
 
 watchdog :: TVar Bool -> Bot ()
 watchdog var = runEffect (produceUpdates >-> checkUpdates)
@@ -231,7 +233,8 @@ nickServId = do m <- await
   where
     isNickServ (Just (IRC.NickName "NickServ" _ _)) = True
     isNickServ _ = False
-    identified m = isNickServ (IRC.msg_prefix m) && "now identified" `isInfixOf` (mconcat . map show) (IRC.msg_params m)
+    identified m = isNickServ (IRC.msg_prefix m) &&
+                   "now identified" `B.isInfixOf` mconcat (IRC.msg_params m)
 
 main =  do queue <- atomically newTQueue
            runIrcBot queue
