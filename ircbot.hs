@@ -57,13 +57,12 @@ nickPassword = "password123"
 connectToServer ::  IO Connection
 connectToServer = do
   ctx <- initConnectionContext
-  con <- connectTo ctx ConnectionParams
-                  { connectionHostname = server
-                  , connectionPort = port                       
-                  , connectionUseSecure = Just $ TLSSettingsSimple True False False
-                  , connectionUseSocks = Nothing
-                  }                       
-  return con
+  connectTo ctx ConnectionParams
+                { connectionHostname = server
+                , connectionPort = port                       
+                , connectionUseSecure = Just $ TLSSettingsSimple True False False
+                , connectionUseSocks = Nothing
+                }                       
 
 type Bot = ReaderT (TQueue B.ByteString) IO
 
@@ -98,7 +97,7 @@ parseCommand :: B.ByteString -> IRC.Message -> Maybe (B.ByteString, B.ByteString
 parseCommand cmd m
   | IRC.msg_command m /= "PRIVMSG" = Nothing
   | (a:b:xs) <- IRC.msg_params m = let (first:rest) = B.words b
-                                   in if (B.tail first == cmd) then Just (a, B.unwords rest) else Nothing
+                                   in if B.tail first == cmd then Just (a, B.unwords rest) else Nothing
                                                              
   | otherwise = Nothing
 
@@ -143,7 +142,7 @@ catchAny m f = Control.Exception.catch m onExc
       | otherwise = True
                     
 runIrcBot :: TQueue String -> IO ()
-runIrcBot queue = forever $ do catchAny (connectToIRCNetwork queue) $ \e -> do
+runIrcBot queue = forever $ do catchAny (connectToIRCNetwork queue) $ \e ->
                                  putStrLn $ "Got an exception " ++ show e
                                threadDelay $ 1000000 * timeout
                                putStrLn "Retrying to connect..."
@@ -151,7 +150,7 @@ runIrcBot queue = forever $ do catchAny (connectToIRCNetwork queue) $ \e -> do
                      
 -- forkIO $ runReaderT (processQueue queue) writeQueue
 connectToIRCNetwork :: TQueue String -> IO ()
-connectToIRCNetwork queue =  do bracket connectToServer disconnect loop
+connectToIRCNetwork queue = bracket connectToServer disconnect loop
   where
     disconnect con = do
       connectionClose con                     
@@ -178,23 +177,22 @@ connectToIRCNetwork queue =  do bracket connectToServer disconnect loop
     waitForThreads (coreThreads, modulesThreads) = void $ waitAnyCatch coreThreads
 
     cleanupThreads (coreThreads, modulesThreads) = do
-      mapM cancel $ coreThreads <> modulesThreads
+      mapM_ cancel $ coreThreads <> modulesThreads
       putStrLn "We are done"
 
-    runModule m input writeQueue = runReaderT (runEffect (fromInput input  >-> messageHandler m)) writeQueue
+    runModule m input = runReaderT (runEffect (fromInput input  >-> messageHandler m))
 
 watchdog :: TVar Bool -> Bot ()
 watchdog var = runEffect (produceUpdates >-> checkUpdates)
-  where produceUpdates = do liftIO $ threadDelay (1000000 * timeout)
-                            update <- liftIO $ atomically $ do v <- readTVar var
-                                                               writeTVar var False
-                                                               return v
-                            yield update
-                            produceUpdates
+  where produceUpdates = forever $ do liftIO $ threadDelay (1000000 * timeout)
+                                      update <- liftIO $ atomically $ do v <- readTVar var
+                                                                         writeTVar var False
+                                                                         return v
+                                      yield update
         checkUpdates = do a <- await
                           if a
                             then checkUpdates 
-                            else do lift $ write ("PING :CoolestBot")
+                            else do lift $ write "PING :CoolestBot"
                                     b <- await
                                     when b checkUpdates
         timeout = 30
@@ -219,14 +217,14 @@ handlePing indicator = do m <- await
    
 nickNegotiation :: Consumer IRC.Message Bot ()
 nickNegotiation = do m <- await
-                     if (IRC.msg_command m == "376")
+                     if IRC.msg_command m == "376"
                        then do liftIO $ putStrLn "connected!"
                                lift $ privmsg "NickServ" ("identify " <> nickPassword)
                        else nickNegotiation
 
 nickServId :: Consumer IRC.Message Bot ()
 nickServId = do m <- await
-                if (identified m)
+                if identified m
                   then do liftIO $ putStrLn "Identified!"
                           lift $ joinChannel chan
                   else nickServId
