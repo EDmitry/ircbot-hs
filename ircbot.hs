@@ -11,6 +11,7 @@ import Network.Connection
   , connectionClose
   )
 import System.IO 
+import System.Exit(exitWith, ExitCode (ExitSuccess)) 
 import qualified GitLab
 import Text.Printf
 import qualified Network.IRC as IRC
@@ -18,14 +19,17 @@ import Web.Scotty
 import Pipes (Consumer, Pipe, Producer, yield, await, (>->), runEffect, cat)
 
 import Control.Monad.STM
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent.Async (async, wait, waitAnyCatch, waitAny, cancel)
 import Control.Concurrent.STM.TQueue
+import Control.Concurrent.STM.TVar (TVar, readTVar, writeTVar, newTVar)
 
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.ByteString.Char8 as B
 
+import Control.Exception (catch, try, throw, SomeException, AsyncException(ThreadKilled))
 import Control.Exception.Base (bracket, finally)
-import Control.Monad (when, forever)
+import Control.Monad (when, forever, void)
 import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Trans (liftIO)
 import Control.Monad.State (StateT, evalStateT, lift)
@@ -73,23 +77,57 @@ writeThread :: TQueue String -> Connection -> IO ()
 writeThread queue con = forever $ do newData <- atomically (readTQueue queue)
                                      connectionPut con $ B.pack (newData ++ "\r\n") 
                                      printf    "> %s\n" newData
- 
-runIrcBot :: TQueue String -> IO ()
-runIrcBot queue = do writeQueue <- atomically newTQueue
-                     bracket (connect writeQueue) disconnect (loop writeQueue)
-  where
-    connect writeQueue = do con <- connectToServer
-                            writerThreadId <- forkIO $ writeThread writeQueue con
-                            return (con, writerThreadId)
-    disconnect (con, writerThreadId) = do connectionClose con
-                                          killThread writerThreadId
-                                          putStrLn "Closing the connection"
-    loop writeQueue (con, _) = do forkIO $ runReaderT (processQueue queue) writeQueue
-                                  runReaderT (do write ("NICK " ++ nick)
-                                                 write ("USER " ++ nick ++ " 0 * :test bot")
-                                                 runEffect (messages con >-> handlePing >-> sequence_ [nickNegotiation, nickServId, forever await])
-                                             ) writeQueue
 
+catchAny :: IO a -> (SomeException -> IO a) -> IO a
+catchAny = Control.Exception.catch
+
+runIrcBot :: TQueue String -> IO ()
+runIrcBot queue = forever $ do catchAny (connectToIRCNetwork queue) $ \e -> do
+                                 putStrLn $ "Got an exception " ++ show e
+                               threadDelay $ 1000000 * timeout
+                               putStrLn "Retrying to connect..."
+  where timeout = 30
+                     
+connectToIRCNetwork :: TQueue String -> IO ()
+connectToIRCNetwork queue =  do bracket connectToServer disconnect loop
+  where
+    disconnect con = do
+      connectionClose con                     
+      putStrLn "Closing the connection"
+
+    loop con = do 
+      writeQueue <- atomically newTQueue
+      watchdogIndicator <- atomically $ newTVar False
+      writerProcess <- async $ writeThread writeQueue con
+      watchDogProcess <- async $ runReaderT (watchdog watchdogIndicator) writeQueue
+      -- forkIO $ runReaderT (processQueue queue) writeQueue
+      readLoop <- async $ runReaderT (do write ("NICK " ++ nick)
+                                         write ("USER " ++ nick ++ " 0 * :test bot")
+                                         runEffect (messages con >->
+                                                    handlePing watchdogIndicator >->
+                                                    sequence_ [nickNegotiation, nickServId, forever await])
+                                     ) writeQueue
+      waitAnyCatch [readLoop, watchDogProcess, writerProcess]
+      mapM cancel [readLoop, watchDogProcess, writerProcess]
+      putStrLn "We are done"
+
+watchdog :: TVar Bool -> Bot ()
+watchdog var = runEffect (produceUpdates >-> checkUpdates)
+  where produceUpdates = do liftIO $ threadDelay (1000000 * timeout)
+                            update <- liftIO $ atomically $ do v <- readTVar var
+                                                               writeTVar var False
+                                                               return v
+                            yield update
+                            produceUpdates
+        checkUpdates = do a <- await
+                          if a
+                            then checkUpdates 
+                            else do lift $ write ("PING :CoolestBot")
+                                    b <- await
+                                    when b checkUpdates
+        timeout = 30
+                          
+ 
 messages :: Connection -> Producer IRC.Message Bot ()
 messages con = do message <- liftIO $ fmap IRC.decode (connectionGetLine 512 con)
                   case message of
@@ -97,12 +135,13 @@ messages con = do message <- liftIO $ fmap IRC.decode (connectionGetLine 512 con
                     Nothing -> return ()
                   messages con
 
-handlePing :: Pipe IRC.Message IRC.Message Bot ()
-handlePing = do m <- await
-                if IRC.msg_command m == "PING"
-                  then (pong . mconcat . map B.unpack) (IRC.msg_params m)
-                  else yield m
-                handlePing
+handlePing :: TVar Bool -> Pipe IRC.Message IRC.Message Bot ()
+handlePing indicator = do m <- await
+                          liftIO $ atomically $ writeTVar indicator True
+                          if IRC.msg_command m == "PING"
+                            then (pong . mconcat . map B.unpack) (IRC.msg_params m)
+                            else yield m
+                          handlePing indicator
   where
     pong x = lift $ write ("PONG :" ++ x) 
    
@@ -125,7 +164,7 @@ nickServId = do m <- await
     identified m = isNickServ (IRC.msg_prefix m) && "now identified" `isInfixOf` (mconcat . map show) (IRC.msg_params m)
 
 main =  do queue <- atomically newTQueue
-           forkIO $ runIrcBot queue
+           runIrcBot queue
   -- web_service queue
 
 -- web_service :: TQueue String -> IO ()
