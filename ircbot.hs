@@ -44,8 +44,14 @@ import Data.Function (on)
 
 server = "irc.freenode.org"
 port   = 6697
+
+nick :: B.ByteString
 nick   = "CoolestBot123048"
+
+chan :: B.ByteString
 chan   = "#bottest"
+
+nickPassword :: B.ByteString
 nickPassword = "password123"
 
 connectToServer ::  IO Connection
@@ -59,7 +65,7 @@ connectToServer = do
                   }                       
   return con
 
-type Bot = ReaderT (TQueue String) IO
+type Bot = ReaderT (TQueue B.ByteString) IO
 
 class BotModule m where
   messageHandler :: m -> Consumer IRC.Message Bot ()
@@ -82,49 +88,49 @@ idConsumer mod = do m <- await
                       Just (chan, body) -> lift $ privmsg chan body
                       Nothing -> return ()
                     case parseJoin m of
-                      Just (nick, chan) -> lift $ privmsg chan ("Greetings, " ++ nick ++ ".")
+                      Just (nick, chan) -> lift $ privmsg chan ("Greetings, " <> nick <> ".")
                       Nothing -> return ()
                     idConsumer mod
             
 --------------------------------------------------------
                  
-parseCommand :: String -> IRC.Message -> Maybe (String, String)
+parseCommand :: B.ByteString -> IRC.Message -> Maybe (B.ByteString, B.ByteString)
 parseCommand cmd m
   | IRC.msg_command m /= "PRIVMSG" = Nothing
-  | (a:b:xs) <- IRC.msg_params m = let (first:rest) = words (B.unpack b)
-                                   in if (tail first == cmd) then Just (B.unpack a, unwords rest) else Nothing
+  | (a:b:xs) <- IRC.msg_params m = let (first:rest) = B.words b
+                                   in if (B.tail first == cmd) then Just (a, B.unwords rest) else Nothing
                                                              
   | otherwise = Nothing
 
-parseJoin :: IRC.Message -> Maybe (String, String)
+parseJoin :: IRC.Message -> Maybe (B.ByteString, B.ByteString)
 parseJoin m
   | IRC.msg_command m /= "JOIN" = Nothing
-  | (Just (IRC.NickName nick _ _)) <- IRC.msg_prefix m = Just (B.unpack nick, B.unpack $ head $ IRC.msg_params m)
+  | (Just (IRC.NickName nick _ _)) <- IRC.msg_prefix m = Just (nick, head $ IRC.msg_params m)
   | otherwise = Nothing
 
 processQueue :: TQueue String -> Bot ()
 processQueue queue = forever $ do newData <- liftIO $ atomically $ readTQueue queue
-                                  privmsg chan newData
+                                  privmsg chan (B.pack newData)
 
-privmsg :: String -> String -> Bot ()
-privmsg dest s = write ("PRIVMSG " ++ dest ++ " :" ++ s)
+privmsg :: B.ByteString -> B.ByteString -> Bot ()
+privmsg dest s = write $ mconcat ["PRIVMSG ", dest, " :", s]
 
-joinChannel :: String -> Bot ()
-joinChannel c = write ("JOIN " ++ c)
+joinChannel :: B.ByteString -> Bot ()
+joinChannel c = write ("JOIN " <> c)
            
-write :: String -> Bot ()
+write :: B.ByteString -> Bot ()
 write s = do
   queue <- ask 
   liftIO $ atomically $ writeTQueue queue s
 
 register = do
-  write ("NICK " ++ nick)                     
-  write ("USER " ++ nick ++ " 0 * :test bot")
+  write ("NICK " <> nick)                     
+  write ("USER " <> nick <> " 0 * :test bot")
 
-writeThread :: TQueue String -> Connection -> IO ()
+writeThread :: TQueue B.ByteString -> Connection -> IO ()
 writeThread queue con = forever $ do newData <- atomically (readTQueue queue)
-                                     connectionPut con $ B.pack (newData ++ "\r\n") 
-                                     printf    "> %s\n" newData
+                                     connectionPut con $ newData <> "\r\n" 
+                                     printf    "> %s\n" (B.unpack newData)
 
 catchAny :: IO a -> (SomeException -> IO a) -> IO a
 catchAny m f = Control.Exception.catch m onExc
@@ -203,17 +209,17 @@ handlePing :: TVar Bool -> Pipe IRC.Message IRC.Message Bot ()
 handlePing indicator = do m <- await
                           liftIO $ atomically $ writeTVar indicator True
                           if IRC.msg_command m == "PING"
-                            then (pong . mconcat . map B.unpack) (IRC.msg_params m)
+                            then (pong . mconcat) (IRC.msg_params m)
                             else yield m
                           handlePing indicator
   where
-    pong x = lift $ write ("PONG :" ++ x) 
+    pong x = lift $ write ("PONG :" <> x) 
    
 nickNegotiation :: Consumer IRC.Message Bot ()
 nickNegotiation = do m <- await
                      if (IRC.msg_command m == "376")
                        then do liftIO $ putStrLn "connected!"
-                               lift $ privmsg "NickServ" ("identify " ++ nickPassword)
+                               lift $ privmsg "NickServ" ("identify " <> nickPassword)
                        else nickNegotiation
 
 nickServId :: Consumer IRC.Message Bot ()
