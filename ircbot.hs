@@ -11,12 +11,14 @@ import Network.Connection
   , connectionPut
   , connectionClose
   )
+import Network.HTTP.Types (ok200)
 import System.IO 
 import System.Exit(exitWith, ExitCode (ExitSuccess)) 
-import qualified GitLab
+import GitLab
 import Text.Printf
 import qualified Network.IRC as IRC
 import Web.Scotty
+import Web.Scotty.TLS (scottyTLS)
 import Pipes (Consumer, Pipe, Producer, yield, await, (>->), runEffect, cat)
 import Pipes.Concurrent (spawn, unbounded, Buffer(Unbounded), toOutput, fromInput)
 
@@ -40,7 +42,6 @@ import qualified Control.Monad.State as S
 import Data.List (isPrefixOf, isInfixOf)
 import Data.Monoid (mconcat, (<>))
 import Data.Default (def)
-import Data.Function (on)
 
 server = "irc.freenode.org"
 port   = 6697
@@ -67,30 +68,62 @@ connectToServer = do
 type Bot = ReaderT (TQueue B.ByteString) IO
 
 class BotModule m where
-  messageHandler :: m -> Consumer IRC.Message Bot ()
+  initForConnection :: m -> Bot (IO (), Consumer IRC.Message Bot ())
   
 data ModuleBox = forall m. BotModule m => ModuleBox m
 instance BotModule ModuleBox where
-  messageHandler (ModuleBox s) = messageHandler s
+  initForConnection (ModuleBox s) = initForConnection s
   
 botModules :: [ModuleBox]
-botModules = [ModuleBox IdModule]
+botModules = [ModuleBox IdModule, ModuleBox GitLabModule]
              
 --------------------------------------------------------
 data IdModule = IdModule 
 instance BotModule IdModule where
-  messageHandler = idConsumer
+  initForConnection m = return (return (), idConsumer)
 
-idConsumer :: IdModule -> Consumer IRC.Message Bot ()
-idConsumer mod = do m <- await
-                    case parseCommand "id" m of
-                      Just (chan, body) -> lift $ privmsg chan body
-                      Nothing -> return ()
-                    case parseJoin m of
-                      Just (nick, chan) -> lift $ privmsg chan ("Greetings, " <> nick <> ".")
-                      Nothing -> return ()
-                    idConsumer mod
+idConsumer :: Consumer IRC.Message Bot ()
+idConsumer = do m <- await
+                case parseCommand "id" m of
+                  Just (chan, body) -> lift $ privmsg chan body
+                  Nothing -> return ()
+                -- case parseJoin m of
+                --   Just (nick, chan) -> lift $ privmsg chan ("Greetings, " <> nick <> ".")
+                --   Nothing -> return ()
+                idConsumer
             
+--------------------------------------------------------
+data GitLabModule = GitLabModule
+instance BotModule GitLabModule where
+  initForConnection m = startWebServer
+  
+startWebServer :: Bot (IO (), Consumer IRC.Message Bot ())
+startWebServer = do queue <- lift $ atomically newTQueue
+                    scottyThread <- lift $ async $ startScottyWithQueue queue
+                    botSettings <- ask
+                    writerThread <- lift $ async $ runReaderT (processQueue queue) botSettings
+                    return (shutdownScotty [scottyThread, writerThread], return ())
+
+processQueue :: TQueue CommitHook -> Bot ()
+processQueue queue = forever $ do hook <- liftIO $ atomically $ readTQueue queue
+                                  privmsg chan (formatHook hook)
+                                  return ()
+  where formatHook h = B.pack $ mconcat [author topCommit, " committed to ", ref h, ": ", message topCommit]
+          where topCommit = head $ commits h
+
+shutdownScotty threads = do mapM_ cancel threads
+                            putStrLn "Shutting down the web server"
+                            return ()
+
+startScottyWithQueue :: TQueue CommitHook -> IO ()
+startScottyWithQueue queue = scotty 25000 $ do
+  post "/" $ do
+    b <- body
+    let j = decode b :: Maybe CommitHook
+    case j of
+      (Just a) -> liftIO $ atomically $ writeTQueue queue a
+      Nothing -> return ()
+    status ok200                                                                  
 --------------------------------------------------------
                  
 parseCommand :: B.ByteString -> IRC.Message -> Maybe (B.ByteString, B.ByteString)
@@ -106,10 +139,6 @@ parseJoin m
   | IRC.msg_command m /= "JOIN" = Nothing
   | (Just (IRC.NickName nick _ _)) <- IRC.msg_prefix m = Just (nick, head $ IRC.msg_params m)
   | otherwise = Nothing
-
-processQueue :: TQueue String -> Bot ()
-processQueue queue = forever $ do newData <- liftIO $ atomically $ readTQueue queue
-                                  privmsg chan (B.pack newData)
 
 privmsg :: B.ByteString -> B.ByteString -> Bot ()
 privmsg dest s = write $ mconcat ["PRIVMSG ", dest, " :", s]
@@ -141,16 +170,15 @@ catchAny m f = Control.Exception.catch m onExc
       | show e == "user interrupt" = False
       | otherwise = True
                     
-runIrcBot :: TQueue String -> IO ()
-runIrcBot queue = forever $ do catchAny (connectToIRCNetwork queue) $ \e ->
-                                 putStrLn $ "Got an exception " ++ show e
-                               threadDelay $ 1000000 * timeout
-                               putStrLn "Retrying to connect..."
+runIrcBot :: IO ()
+runIrcBot = forever $ do catchAny connectToIRCNetwork $ \e ->
+                           putStrLn $ "Got an exception " ++ show e
+                         threadDelay $ 1000000 * timeout
+                         putStrLn "Retrying to connect..."
   where timeout = 30
                      
--- forkIO $ runReaderT (processQueue queue) writeQueue
-connectToIRCNetwork :: TQueue String -> IO ()
-connectToIRCNetwork queue = bracket connectToServer disconnect loop
+connectToIRCNetwork :: IO ()
+connectToIRCNetwork = bracket connectToServer disconnect loop
   where
     disconnect con = do
       connectionClose con                     
@@ -164,23 +192,26 @@ connectToIRCNetwork queue = bracket connectToServer disconnect loop
       writerThread <- async $ writeThread writeQueue con
       watchDogThread <- async $ runReaderT (watchdog watchdogIndicator) writeQueue
       modulesWithBoxes <- mapM (\m -> do (output, input) <- spawn unbounded
-                                         return (m, output, input)) botModules
-      let modulesOutputs = foldl1 (<>) (map (\(_, b, _) -> b) modulesWithBoxes)
-      modulesThreads <- mapM (\(m, _, input) -> async $ runModule m input writeQueue) modulesWithBoxes
+                                         (deinit, consumer) <- runReaderT (initForConnection m) writeQueue
+                                         return (deinit, consumer, output, input)) botModules
+      let modulesOutputs = foldl1 (<>) (map (\(_, _, b, _) -> b) modulesWithBoxes)
+      modulesThreads <- mapM (\(_, consumer, _, input) -> async $ runModulesConsumer consumer input writeQueue) modulesWithBoxes
+      let modulesDeinits = map (\(a, _, _, _) -> a) modulesWithBoxes
       readThread <- async $ flip runReaderT writeQueue $ do
         register
         runEffect (messages con >->
                    handlePing watchdogIndicator >->
                    sequence_ [nickNegotiation, nickServId, toOutput modulesOutputs])
-      return ([readThread, watchDogThread, writerThread], modulesThreads)
+      return ([readThread, watchDogThread, writerThread], modulesThreads, modulesDeinits)
 
-    waitForThreads (coreThreads, modulesThreads) = void $ waitAnyCatch coreThreads
+    waitForThreads (coreThreads, modulesThreads, _) = void $ waitAnyCatch coreThreads
 
-    cleanupThreads (coreThreads, modulesThreads) = do
+    cleanupThreads (coreThreads, modulesThreads, modulesDeinits) = do
       mapM_ cancel $ coreThreads <> modulesThreads
+      sequence_ modulesDeinits
       putStrLn "We are done"
 
-    runModule m input = runReaderT (runEffect (fromInput input  >-> messageHandler m))
+    runModulesConsumer consumer input = runReaderT (runEffect (fromInput input  >-> consumer))
 
 watchdog :: TVar Bool -> Bot ()
 watchdog var = runEffect (produceUpdates >-> checkUpdates)
@@ -227,6 +258,7 @@ nickServId = do m <- await
                 if identified m
                   then do liftIO $ putStrLn "Identified!"
                           lift $ joinChannel chan
+                          lift $ privmsg "ChanServ" ("op " <> chan <> " " <> nick)
                   else nickServId
   where
     isNickServ (Just (IRC.NickName "NickServ" _ _)) = True
@@ -234,12 +266,5 @@ nickServId = do m <- await
     identified m = isNickServ (IRC.msg_prefix m) &&
                    "now identified" `B.isInfixOf` mconcat (IRC.msg_params m)
 
-main =  do queue <- atomically newTQueue
-           runIrcBot queue
-  -- web_service queue
+main =  do runIrcBot
 
--- web_service :: TQueue String -> IO ()
--- web_service queue = scotty 25000 $ do
---   get "/" $ do
---     liftIO $ atomically $ writeTQueue queue "test passed"    
---     status ok200

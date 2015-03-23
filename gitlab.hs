@@ -6,6 +6,9 @@ import Control.Applicative
 import Data.Monoid
 import qualified Data.ByteString.Lazy.Char8 as BL
 
+decode :: FromJSON a => BL.ByteString -> Maybe a
+decode = Data.Aeson.decode
+
 data Commit = Commit { id :: String
                      , message :: String
                      , author :: String
