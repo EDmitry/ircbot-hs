@@ -12,6 +12,7 @@ import Network.Connection
   , connectionClose
   )
 import Network.HTTP.Types (ok200)
+import Network.Socket (PortNumber)
 import System.IO 
 import System.Exit(exitWith, ExitCode (ExitSuccess)) 
 import GitLab
@@ -37,26 +38,14 @@ import Control.Monad (when, forever, void)
 import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Trans (liftIO)
 import Control.Monad.State (StateT, evalStateT, lift)
-import Control.Monad.Reader (runReaderT, ReaderT, ask)
+import Control.Monad.Reader (runReaderT, ReaderT, ask, asks)
 import qualified Control.Monad.State as S
 import Data.List (isPrefixOf, isInfixOf)
 import Data.Monoid (mconcat, (<>))
 import Data.Default (def)
 
-server = "irc.freenode.org"
-port   = 6697
-
-nick :: B.ByteString
-nick   = "CoolestBot123048"
-
-chan :: B.ByteString
-chan   = "#bottest"
-
-nickPassword :: B.ByteString
-nickPassword = "password123"
-
-connectToServer ::  IO Connection
-connectToServer = do
+connectToServer :: String -> PortNumber -> IO Connection
+connectToServer server port = do
   ctx <- initConnectionContext
   connectTo ctx ConnectionParams
                 { connectionHostname = server
@@ -65,7 +54,22 @@ connectToServer = do
                 , connectionUseSocks = Nothing
                 }                       
 
-type Bot = ReaderT (TQueue B.ByteString) IO
+type Bot = ReaderT BotData IO
+
+data BotSettings =  BotSettings
+                    { server :: String
+                    , port :: PortNumber 
+                    , nick :: B.ByteString
+                    , nickPassword :: B.ByteString
+                    , chan :: B.ByteString
+                    , chanPassword :: B.ByteString
+                    , modules :: [ModuleBox]
+                    }
+
+data BotData = BotData
+               { botSettings :: BotSettings
+               , writeQueue :: TQueue B.ByteString
+               }
 
 class BotModule m where
   initForConnection :: m -> Bot (IO (), Consumer IRC.Message Bot ())
@@ -74,9 +78,6 @@ data ModuleBox = forall m. BotModule m => ModuleBox m
 instance BotModule ModuleBox where
   initForConnection (ModuleBox s) = initForConnection s
   
-botModules :: [ModuleBox]
-botModules = [ModuleBox IdModule, ModuleBox GitLabModule]
-             
 --------------------------------------------------------
 data IdModule = IdModule 
 instance BotModule IdModule where
@@ -106,7 +107,9 @@ startWebServer = do queue <- lift $ atomically newTQueue
 
 processQueue :: TQueue CommitHook -> Bot ()
 processQueue queue = forever $ do hook <- liftIO $ atomically $ readTQueue queue
-                                  privmsg chan (formatHook hook)
+                                  case commits hook of
+                                    [] -> liftIO $ putStrLn ("Malformed hook: " <> show hook)
+                                    otherwise -> asks (chan . botSettings) >>= (`privmsg` (formatHook hook))
                                   return ()
   where formatHook h = B.pack $ mconcat [author topCommit, " committed to ", ref h, ": ", message topCommit]
           where topCommit = head $ commits h
@@ -148,12 +151,13 @@ joinChannel c = write ("JOIN " <> c)
            
 write :: B.ByteString -> Bot ()
 write s = do
-  queue <- ask 
+  queue <- asks writeQueue 
   liftIO $ atomically $ writeTQueue queue s
 
 register = do
-  write ("NICK " <> nick)                     
-  write ("USER " <> nick <> " 0 * :test bot")
+  n <- asks $ nick . botSettings
+  write ("NICK " <> n)                     
+  write ("USER " <> n <> " 0 * :test bot")
 
 writeThread :: TQueue B.ByteString -> Connection -> IO ()
 writeThread queue con = forever $ do newData <- atomically (readTQueue queue)
@@ -170,15 +174,15 @@ catchAny m f = Control.Exception.catch m onExc
       | show e == "user interrupt" = False
       | otherwise = True
                     
-runIrcBot :: IO ()
-runIrcBot = forever $ do catchAny connectToIRCNetwork $ \e ->
-                           putStrLn $ "Got an exception " ++ show e
-                         threadDelay $ 1000000 * timeout
-                         putStrLn "Retrying to connect..."
+runIrcBot :: BotSettings -> IO ()
+runIrcBot settings = forever $ do catchAny (connectToIRCNetwork settings) $ \e ->
+                                    putStrLn $ "Got an exception " ++ show e
+                                  threadDelay $ 1000000 * timeout
+                                  putStrLn "Retrying to connect..."
   where timeout = 30
                      
-connectToIRCNetwork :: IO ()
-connectToIRCNetwork = bracket connectToServer disconnect loop
+connectToIRCNetwork :: BotSettings -> IO ()
+connectToIRCNetwork settings = bracket (connectToServer (server settings) (port settings)) disconnect loop
   where
     disconnect con = do
       connectionClose con                     
@@ -187,24 +191,29 @@ connectToIRCNetwork = bracket connectToServer disconnect loop
     loop con = bracket (runThreads con) cleanupThreads waitForThreads
 
     runThreads con = do
-      writeQueue <- atomically newTQueue
+      writeQueue' <- atomically newTQueue
+      let botData = BotData { writeQueue = writeQueue', botSettings = settings }
       watchdogIndicator <- atomically $ newTVar False
-      writerThread <- async $ writeThread writeQueue con
-      watchDogThread <- async $ runReaderT (watchdog watchdogIndicator) writeQueue
+      writerThread <- async $ writeThread writeQueue' con
+      watchDogThread <- async $ runReaderT (watchdog watchdogIndicator) botData
       modulesWithBoxes <- mapM (\m -> do (output, input) <- spawn unbounded
-                                         (deinit, consumer) <- runReaderT (initForConnection m) writeQueue
-                                         return (deinit, consumer, output, input)) botModules
+                                         (deinit, consumer) <- runReaderT (initForConnection m) botData
+                                         return (deinit, consumer, output, input)) (modules settings)
       let modulesOutputs = foldl1 (<>) (map (\(_, _, b, _) -> b) modulesWithBoxes)
-      modulesThreads <- mapM (\(_, consumer, _, input) -> async $ runModulesConsumer consumer input writeQueue) modulesWithBoxes
+      modulesThreads <- mapM (\(_, consumer, _, input) -> async $ runModulesConsumer consumer input botData) modulesWithBoxes
       let modulesDeinits = map (\(a, _, _, _) -> a) modulesWithBoxes
-      readThread <- async $ flip runReaderT writeQueue $ do
+      readThread <- async $ flip runReaderT botData $ do
         register
         runEffect (messages con >->
                    handlePing watchdogIndicator >->
                    sequence_ [nickNegotiation, nickServId, toOutput modulesOutputs])
       return ([readThread, watchDogThread, writerThread], modulesThreads, modulesDeinits)
 
-    waitForThreads (coreThreads, modulesThreads, _) = void $ waitAnyCatch coreThreads
+    waitForThreads (coreThreads, modulesThreads, _) = do (_, c) <- waitAnyCatch coreThreads
+                                                         case c of
+                                                           Left e -> putStrLn ("EXCEPTION: " <> show e)
+                                                           Right _ -> putStrLn "Exited correctly"
+
 
     cleanupThreads (coreThreads, modulesThreads, modulesDeinits) = do
       mapM_ cancel $ coreThreads <> modulesThreads
@@ -250,15 +259,18 @@ nickNegotiation :: Consumer IRC.Message Bot ()
 nickNegotiation = do m <- await
                      if IRC.msg_command m == "376"
                        then do liftIO $ putStrLn "connected!"
-                               lift $ privmsg "NickServ" ("identify " <> nickPassword)
+                               np <- asks $ nickPassword . botSettings
+                               lift $ privmsg "NickServ" ("identify " <> np)
                        else nickNegotiation
 
 nickServId :: Consumer IRC.Message Bot ()
 nickServId = do m <- await
                 if identified m
                   then do liftIO $ putStrLn "Identified!"
-                          lift $ joinChannel chan
-                          lift $ privmsg "ChanServ" ("op " <> chan <> " " <> nick)
+                          c <- asks $ chan . botSettings
+                          n <- asks $ nick . botSettings
+                          lift $ joinChannel c
+                          lift $ privmsg "ChanServ" ("op " <> c <> " " <> n)
                   else nickServId
   where
     isNickServ (Just (IRC.NickName "NickServ" _ _)) = True
@@ -266,5 +278,11 @@ nickServId = do m <- await
     identified m = isNickServ (IRC.msg_prefix m) &&
                    "now identified" `B.isInfixOf` mconcat (IRC.msg_params m)
 
-main =  do runIrcBot
-
+main =  do runIrcBot BotSettings { server = "irc.freenode.org"
+                                 , port = 6697
+                                 , nick = "CoolestBot123048"
+                                 , chan = "#bottest"
+                                 , chanPassword = ""
+                                 , nickPassword = "password123"
+                                 , modules = [ModuleBox IdModule, ModuleBox GitLabModule]
+                                 }
