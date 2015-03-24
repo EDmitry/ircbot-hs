@@ -1,5 +1,22 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ExistentialQuantification #-}
+module IrcBot (BotSettings (BotSettings
+                           , server
+                           , port
+                           , nick
+                           , chan
+                           , chanPassword
+                           , nickPassword
+                           , modules)
+               , runIrcBot
+               , BotModule (initForConnection)
+               , ModuleBox (ModuleBox)
+               , Bot
+               , botSettings
+               , privmsg
+               , IRC.Message
+               ) where
+
 import Network.Connection
   (Connection
   , TLSSettings (TLSSettingsSimple)
@@ -11,15 +28,11 @@ import Network.Connection
   , connectionPut
   , connectionClose
   )
-import Network.HTTP.Types (ok200)
 import Network.Socket (PortNumber)
 import System.IO 
 import System.Exit(exitWith, ExitCode (ExitSuccess)) 
-import GitLab
 import Text.Printf
 import qualified Network.IRC as IRC
-import Web.Scotty
-import Web.Scotty.TLS (scottyTLS)
 import Pipes (Consumer, Pipe, Producer, yield, await, (>->), runEffect, cat)
 import Pipes.Concurrent (spawn, unbounded, Buffer(Unbounded), toOutput, fromInput)
 
@@ -36,8 +49,7 @@ import Control.Exception (throwIO, catch, try, throw, SomeException, AsyncExcept
 import Control.Exception.Base (bracket, finally)
 import Control.Monad (when, forever, void)
 import Control.Monad.IO.Class (MonadIO)
-import Control.Monad.Trans (liftIO)
-import Control.Monad.State (StateT, evalStateT, lift)
+import Control.Monad.Trans (lift, liftIO)
 import Control.Monad.Reader (runReaderT, ReaderT, ask, asks)
 import qualified Control.Monad.State as S
 import Data.List (isPrefixOf, isInfixOf)
@@ -94,39 +106,6 @@ idConsumer = do m <- await
                 idConsumer
             
 --------------------------------------------------------
-data GitLabModule = GitLabModule
-instance BotModule GitLabModule where
-  initForConnection m = startWebServer
-  
-startWebServer :: Bot (IO (), Consumer IRC.Message Bot ())
-startWebServer = do queue <- lift $ atomically newTQueue
-                    scottyThread <- lift $ async $ startScottyWithQueue queue
-                    botSettings <- ask
-                    writerThread <- lift $ async $ runReaderT (processQueue queue) botSettings
-                    return (shutdownScotty [scottyThread, writerThread], return ())
-
-processQueue :: TQueue CommitHook -> Bot ()
-processQueue queue = forever $ do hook <- liftIO $ atomically $ readTQueue queue
-                                  case commits hook of
-                                    [] -> liftIO $ putStrLn ("Malformed hook: " <> show hook)
-                                    otherwise -> asks (chan . botSettings) >>= (`privmsg` (formatHook hook))
-                                  return ()
-  where formatHook h = B.pack $ mconcat [author topCommit, " committed to ", ref h, ": ", message topCommit]
-          where topCommit = head $ commits h
-
-shutdownScotty threads = do mapM_ cancel threads
-                            putStrLn "Shutting down the web server"
-                            return ()
-
-startScottyWithQueue :: TQueue CommitHook -> IO ()
-startScottyWithQueue queue = scotty 25000 $ do
-  post "/" $ do
-    b <- body
-    let j = decode b :: Maybe CommitHook
-    case j of
-      (Just a) -> liftIO $ atomically $ writeTQueue queue a
-      Nothing -> return ()
-    status ok200                                                                  
 --------------------------------------------------------
                  
 parseCommand :: B.ByteString -> IRC.Message -> Maybe (B.ByteString, B.ByteString)
@@ -277,12 +256,3 @@ nickServId = do m <- await
     isNickServ _ = False
     identified m = isNickServ (IRC.msg_prefix m) &&
                    "now identified" `B.isInfixOf` mconcat (IRC.msg_params m)
-
-main =  do runIrcBot BotSettings { server = "irc.freenode.org"
-                                 , port = 6697
-                                 , nick = "CoolestBot123048"
-                                 , chan = "#bottest"
-                                 , chanPassword = ""
-                                 , nickPassword = "password123"
-                                 , modules = [ModuleBox IdModule, ModuleBox GitLabModule]
-                                 }
