@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module GitLab where
+module GitLab (GitLabModule (GitLabModule)) where
 
 import qualified IrcBot (Message)       
 import IrcBot

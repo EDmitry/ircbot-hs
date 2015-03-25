@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Blame where
+module Blame (BlameModule (BlameModule)) where
 
 import Prelude hiding (mapM_, sum)
 import GHC.IO.Handle (Handle, hIsEOF)
