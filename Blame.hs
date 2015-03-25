@@ -63,6 +63,6 @@ blameProducer f git repo = do
 blameProducer' :: Handle -> Producer String IO ()
 blameProducer' h = do eof <- lift $ hIsEOF h
                       unless eof $ do
-                      s <- lift $ hGetLine h
-                      yield s
-                      blameProducer' h
+                        s <- lift $ hGetLine h
+                        yield s
+                        blameProducer' h
