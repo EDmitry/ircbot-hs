@@ -6,7 +6,6 @@ import IrcBot
 import Data.Aeson
 import Control.Applicative
 import Data.Monoid
-import qualified Data.ByteString.Lazy.Char8 as BL
 import Network.HTTP.Types (ok200)
 import Web.Scotty
 import Web.Scotty.TLS (scottyTLS)
@@ -75,7 +74,7 @@ shutdownScotty threads = do mapM_ cancel threads
                             return ()
 
 startScottyWithQueue :: TQueue CommitHook -> IO ()
-startScottyWithQueue queue = scotty 25000 $ do
+startScottyWithQueue queue = scotty 25000 $
   post "/" $ do
     b <- body
     let j = decode b :: Maybe CommitHook

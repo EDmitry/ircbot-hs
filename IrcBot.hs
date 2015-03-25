@@ -15,6 +15,7 @@ module IrcBot (BotSettings (BotSettings
                , botSettings
                , privmsg
                , IRC.Message
+               , parseCommand
                ) where
 
 import Network.Connection
@@ -125,8 +126,8 @@ parseJoin m
 privmsg :: B.ByteString -> B.ByteString -> Bot ()
 privmsg dest s = write $ mconcat ["PRIVMSG ", dest, " :", s]
 
-joinChannel :: B.ByteString -> Bot ()
-joinChannel c = write ("JOIN " <> c)
+joinChannel :: B.ByteString -> B.ByteString -> Bot ()
+joinChannel c p = write ("JOIN " <> c <> " " <> p)
            
 write :: B.ByteString -> Bot ()
 write s = do
@@ -248,7 +249,8 @@ nickServId = do m <- await
                   then do liftIO $ putStrLn "Identified!"
                           c <- asks $ chan . botSettings
                           n <- asks $ nick . botSettings
-                          lift $ joinChannel c
+                          p <- asks $ chanPassword . botSettings
+                          lift $ joinChannel c p
                           lift $ privmsg "ChanServ" ("op " <> c <> " " <> n)
                   else nickServId
   where
