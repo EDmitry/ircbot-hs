@@ -6,6 +6,7 @@ import IrcBot
 import Data.Aeson
 import Control.Applicative
 import Data.Monoid
+import Data.Char (chr)
 import Network.HTTP.Types (ok200)
 import Web.Scotty
 import Web.Scotty.TLS (scottyTLS)
@@ -64,10 +65,13 @@ processQueue :: TQueue CommitHook -> Bot ()
 processQueue queue = forever $ do hook <- liftIO $ atomically $ readTQueue queue
                                   case commits hook of
                                     [] -> liftIO $ putStrLn ("Malformed hook: " <> show hook)
-                                    otherwise -> asks (chan . botSettings) >>= (`privmsg` (formatHook hook))
+                                    otherwise -> asks (chan . botSettings) >>= (`privmsg` (formatGray . formatHook $ hook))
                                   return ()
   where formatHook h = B.pack $ mconcat [author topCommit, " committed to ", ref h, ": ", message topCommit]
           where topCommit = head $ commits h
+
+        formatGray :: B.ByteString -> B.ByteString
+        formatGray s = B.pack (chr 3 : "14") <> s
 
 shutdownScotty threads = do mapM_ cancel threads
                             putStrLn "Shutting down the web server"
