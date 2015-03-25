@@ -16,6 +16,7 @@ module IrcBot (BotSettings (BotSettings
                , privmsg
                , IRC.Message
                , parseCommand
+               , write
                ) where
 
 import Network.Connection
