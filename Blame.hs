@@ -35,7 +35,7 @@ consumer mod@(BlameModule gitPath repoPath) = do
 
 blame :: FilePath -> FilePath -> String -> IO String
 blame gitPath repoPath file = do
-    let sfile = takeFileName file
+    let sfile = filter (/='.') file
     e <- doesFileExist (repoPath </> sfile) 
     if e then do
       m <- sortBy (flip compare `on` snd) . Map.toList <$> blameMap sfile
