@@ -258,4 +258,4 @@ nickServId = do m <- await
     isNickServ (Just (IRC.NickName "NickServ" _ _)) = True
     isNickServ _ = False
     identified m = isNickServ (IRC.msg_prefix m) &&
-                   "now identified" `B.isInfixOf` mconcat (IRC.msg_params m)
+                    any (`B.isInfixOf` mconcat (IRC.msg_params m)) ["now identified", "now recognized"]
