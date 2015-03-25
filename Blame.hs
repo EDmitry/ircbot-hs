@@ -57,12 +57,5 @@ extractAuthors = do s <- await
 
 blameProducer :: FilePath -> FilePath -> FilePath -> Producer String IO ()
 blameProducer f git repo = do 
-  (hin, hout, herr, h) <- lift $ runInteractiveProcess git ["blame", "--line-porcelain", repo </> f] (Just repo) Nothing
-  blameProducer' hout
-
-blameProducer' :: Handle -> Producer String IO ()
-blameProducer' h = do eof <- lift $ hIsEOF h
-                      unless eof $ do
-                        s <- lift $ hGetLine h
-                        yield s
-                        blameProducer' h
+  (_, hout, _, _) <- lift $ runInteractiveProcess git ["blame", "--line-porcelain", repo </> f] (Just repo) Nothing
+  P.fromHandle hout
